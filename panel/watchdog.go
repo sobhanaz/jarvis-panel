@@ -32,6 +32,10 @@ type watchdogConfig struct {
 	LastBackupDate   string `json:"last_backup_date,omitempty"`
 }
 
+// backupDir is where `hashem backup` writes encrypted archives; a var so tests
+// can point it at a temp dir instead of the real system path.
+var backupDir = "/var/backups/hashem"
+
 type backupItem struct {
 	Name string `json:"name"`
 	Size int64  `json:"size"`
@@ -137,7 +141,7 @@ func formatSchedule(c watchdogConfig) string {
 }
 
 func listBackups() []backupItem {
-	dir := "/var/backups/hashem"
+	dir := backupDir
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return []backupItem{}
@@ -341,7 +345,7 @@ func handleWatchdogPost(w http.ResponseWriter, r *http.Request) {
 			writeAPIError(w, r, "E-WD-01", "invalid backup file name")
 			return
 		}
-		path := filepath.Join("/var/backups/hashem", base)
+		path := filepath.Join(backupDir, base)
 		if _, err := os.Stat(path); err != nil {
 			writeAPIError(w, r, "E-WD-01", "backup file not found")
 			return
@@ -415,7 +419,7 @@ func handleBackupDownload(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, r, "E-WD-01", "invalid backup file name")
 		return
 	}
-	path := filepath.Join("/var/backups/hashem", base)
+	path := filepath.Join(backupDir, base)
 	st, err := os.Stat(path)
 	if err != nil || st.IsDir() {
 		writeAPIError(w, r, "E-WD-01", "backup file not found")

@@ -17,21 +17,21 @@ import (
 )
 
 type doctorReport struct {
-	Timestamp       string          `json:"timestamp"`
-	Role            string          `json:"role"`
-	PeerGREIP       string          `json:"peer_gre_ip"`
-	TunnelName      string          `json:"tunnel_name"`
-	InterfaceUp     bool            `json:"interface_up"`
-	FRPUp           bool            `json:"frp_up"`
-	PingResult      pingSummary     `json:"ping_result"`
-	MTUResult       mtuSummary      `json:"mtu_result"`
-	KernelAudit     kernelAudit     `json:"kernel_audit"`
-	SpeedResult     speedSummary    `json:"speed_result"`
-	Score           int             `json:"score"`
-	Rating          string          `json:"rating"` // "excellent", "good", "warning", "critical"
-	Issues          []string        `json:"issues"`
-	Recommendations []string        `json:"recommendations"`
-	FixAvailable    bool            `json:"fix_available"`
+	Timestamp       string       `json:"timestamp"`
+	Role            string       `json:"role"`
+	PeerGREIP       string       `json:"peer_gre_ip"`
+	TunnelName      string       `json:"tunnel_name"`
+	InterfaceUp     bool         `json:"interface_up"`
+	FRPUp           bool         `json:"frp_up"`
+	PingResult      pingSummary  `json:"ping_result"`
+	MTUResult       mtuSummary   `json:"mtu_result"`
+	KernelAudit     kernelAudit  `json:"kernel_audit"`
+	SpeedResult     speedSummary `json:"speed_result"`
+	Score           int          `json:"score"`
+	Rating          string       `json:"rating"` // "excellent", "good", "warning", "critical"
+	Issues          []string     `json:"issues"`
+	Recommendations []string     `json:"recommendations"`
+	FixAvailable    bool         `json:"fix_available"`
 }
 
 type pingSummary struct {
@@ -142,15 +142,15 @@ func runFullDiagnostics() *doctorReport {
 	}
 
 	rep := &doctorReport{
-		Timestamp:   time.Now().UTC().Format(time.RFC3339),
-		Role:        st.Role,
-		PeerGREIP:   peerIP,
-		TunnelName:  "gre-tunnel",
-		InterfaceUp: st.Gre.Exists,
-		FRPUp:       st.FrpUp,
-		Score:       100,
-		Rating:      "excellent",
-		Issues:      []string{},
+		Timestamp:       time.Now().UTC().Format(time.RFC3339),
+		Role:            st.Role,
+		PeerGREIP:       peerIP,
+		TunnelName:      "gre-tunnel",
+		InterfaceUp:     st.Gre.Exists,
+		FRPUp:           st.FrpUp,
+		Score:           100,
+		Rating:          "excellent",
+		Issues:          []string{},
 		Recommendations: []string{},
 	}
 

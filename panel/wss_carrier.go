@@ -63,21 +63,22 @@ type wssCarrierManager struct {
 	cfg            wssConfig
 	ctx            context.Context
 	cancel         context.CancelFunc
-	running        bool
+	running        atomic.Bool
 	connected      int32 // 1 if connected, 0 otherwise
 	bytesSent      int64
 	bytesRecv      int64
 	packetsSent    int64
 	packetsRecv    int64
-	latencyMs      int64 // stored in microseconds for atomic ops
-	lastConnected  string
+	latencyMs      int64  // stored in microseconds for atomic ops
+	lastConnected  string // guarded by resMu
 	reconnectCount int32
 	lastError      string
 	errMu          sync.Mutex
-	httpServer     *http.Server
+	httpServer     *http.Server // guarded by resMu
 	activeConn     *websocket.Conn
 	connMu         sync.Mutex
-	udpConn        *net.UDPConn
+	udpConn        *net.UDPConn // guarded by resMu
+	resMu          sync.Mutex
 }
 
 func wssConfigPath() string {
@@ -218,7 +219,7 @@ func getWSSStatus() wssCarrierStatus {
 	mgr := wssActiveState
 	wssMu.RUnlock()
 
-	if mgr == nil || !mgr.running {
+	if mgr == nil || !mgr.running.Load() {
 		cfg := loadWSSConfig()
 		return wssCarrierStatus{
 			Running:    false,
@@ -246,7 +247,7 @@ func getWSSStatus() wssCarrierStatus {
 		PacketsSent:    atomic.LoadInt64(&mgr.packetsSent),
 		PacketsRecv:    atomic.LoadInt64(&mgr.packetsRecv),
 		LatencyMs:      latency,
-		LastConnected:  mgr.lastConnected,
+		LastConnected:  mgr.lastConnectedAt(),
 		ReconnectCount: int(atomic.LoadInt32(&mgr.reconnectCount)),
 		LastError:      lastErr,
 	}
@@ -256,22 +257,21 @@ func startWSSCarrier(cfg wssConfig) error {
 	wssMu.Lock()
 	defer wssMu.Unlock()
 
-	if wssActiveState != nil && wssActiveState.running {
+	if wssActiveState != nil && wssActiveState.running.Load() {
 		_ = wssActiveState.stop()
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	mgr := &wssCarrierManager{
-		cfg:     cfg,
-		ctx:     ctx,
-		cancel:  cancel,
-		running: true,
+		cfg:    cfg,
+		ctx:    ctx,
+		cancel: cancel,
 	}
+	mgr.running.Store(true)
 	wssActiveState = mgr
 
 	if runtime.GOOS == "windows" {
-		atomic.StoreInt32(&mgr.connected, 1)
-		mgr.lastConnected = time.Now().Format("2006-01-02 15:04:05")
+		mgr.markConnected()
 		return nil
 	}
 
@@ -298,7 +298,7 @@ func stopWSSCarrier() error {
 	wssMu.Lock()
 	defer wssMu.Unlock()
 
-	if wssActiveState == nil || !wssActiveState.running {
+	if wssActiveState == nil || !wssActiveState.running.Load() {
 		return nil
 	}
 	err := wssActiveState.stop()
@@ -307,7 +307,10 @@ func stopWSSCarrier() error {
 }
 
 func (m *wssCarrierManager) stop() error {
-	m.running = false
+	m.running.Store(false)
+	// cancel() must happen before the resource snapshot below: trackUDP/trackHTTP
+	// check ctx under resMu, so a goroutine still starting up either registers in
+	// time for us to close it, or sees the cancellation and never serves.
 	if m.cancel != nil {
 		m.cancel()
 	}
@@ -318,13 +321,16 @@ func (m *wssCarrierManager) stop() error {
 	}
 	m.connMu.Unlock()
 
-	if m.httpServer != nil {
+	m.resMu.Lock()
+	srv, udp := m.httpServer, m.udpConn
+	m.resMu.Unlock()
+	if srv != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
-		_ = m.httpServer.Shutdown(ctx)
+		_ = srv.Shutdown(ctx)
 	}
-	if m.udpConn != nil {
-		_ = m.udpConn.Close()
+	if udp != nil {
+		_ = udp.Close()
 	}
 	atomic.StoreInt32(&m.connected, 0)
 	return nil
@@ -337,6 +343,43 @@ func (m *wssCarrierManager) setErr(err error) {
 	m.errMu.Lock()
 	m.lastError = err.Error()
 	m.errMu.Unlock()
+}
+
+// trackUDP registers the bridge socket so stop() can close it. It reports false when
+// the carrier was already stopped, in which case the caller must exit without serving.
+func (m *wssCarrierManager) trackUDP(c *net.UDPConn) bool {
+	m.resMu.Lock()
+	defer m.resMu.Unlock()
+	if m.ctx.Err() != nil {
+		return false
+	}
+	m.udpConn = c
+	return true
+}
+
+// trackHTTP registers the HTTP server like trackUDP: a stop() that already ran must
+// not be followed by a listener that nothing will ever shut down.
+func (m *wssCarrierManager) trackHTTP(srv *http.Server) bool {
+	m.resMu.Lock()
+	defer m.resMu.Unlock()
+	if m.ctx.Err() != nil {
+		return false
+	}
+	m.httpServer = srv
+	return true
+}
+
+func (m *wssCarrierManager) markConnected() {
+	atomic.StoreInt32(&m.connected, 1)
+	m.resMu.Lock()
+	m.lastConnected = time.Now().Format("2006-01-02 15:04:05")
+	m.resMu.Unlock()
+}
+
+func (m *wssCarrierManager) lastConnectedAt() string {
+	m.resMu.Lock()
+	defer m.resMu.Unlock()
+	return m.lastConnected
 }
 
 // runServer starts the WebSocket receiver and bridges to local UDP FOU
@@ -358,8 +401,10 @@ func (m *wssCarrierManager) runServer() {
 		m.setErr(fmt.Errorf("listen local udp: %w", err))
 		return
 	}
-	m.udpConn = udpConn
 	defer udpConn.Close()
+	if !m.trackUDP(udpConn) {
+		return
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/tunnel-stream", func(w http.ResponseWriter, r *http.Request) {
@@ -386,8 +431,7 @@ func (m *wssCarrierManager) runServer() {
 		m.activeConn = ws
 		m.connMu.Unlock()
 
-		atomic.StoreInt32(&m.connected, 1)
-		m.lastConnected = time.Now().Format("2006-01-02 15:04:05")
+		m.markConnected()
 
 		m.bridgePump(ws, udpConn, udpAddr)
 	})
@@ -396,7 +440,9 @@ func (m *wssCarrierManager) runServer() {
 		Addr:    fmt.Sprintf(":%d", m.cfg.ListenPort),
 		Handler: mux,
 	}
-	m.httpServer = server
+	if !m.trackHTTP(server) {
+		return
+	}
 
 	// TLS Setup
 	if m.cfg.UseTLS {
@@ -443,10 +489,12 @@ func (m *wssCarrierManager) runClient() {
 		m.setErr(fmt.Errorf("listen local udp: %w", err))
 		return
 	}
-	m.udpConn = udpConn
 	defer udpConn.Close()
+	if !m.trackUDP(udpConn) {
+		return
+	}
 
-	for m.running {
+	for m.running.Load() {
 		select {
 		case <-m.ctx.Done():
 			return
@@ -492,8 +540,7 @@ func (m *wssCarrierManager) runClient() {
 
 		rtt := time.Since(t0).Microseconds()
 		atomic.StoreInt64(&m.latencyMs, rtt)
-		atomic.StoreInt32(&m.connected, 1)
-		m.lastConnected = time.Now().Format("2006-01-02 15:04:05")
+		m.markConnected()
 
 		m.connMu.Lock()
 		m.activeConn = ws

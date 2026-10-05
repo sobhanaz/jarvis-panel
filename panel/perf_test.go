@@ -54,6 +54,7 @@ func TestPerfDefaultsAndLoadSave(t *testing.T) {
 		DPIEnabled:       false,
 		DPIRate:          "500/min",
 		DPIBurst:         150,
+		FRPMaxPool:       80,
 	}
 	if err := savePerfConfig(custom); err != nil {
 		t.Fatalf("savePerfConfig failed: %v", err)
@@ -74,6 +75,19 @@ func TestPerfDefaultsAndLoadSave(t *testing.T) {
 	loaded := loadPerfConfig()
 	if loaded != custom {
 		t.Fatalf("expected %+v, got %+v", custom, loaded)
+	}
+
+	// FRPMaxPool <= 0 is normalized to the default pool of 50 when saving.
+	zeroPool := custom
+	zeroPool.FRPMaxPool = 0
+	if err := savePerfConfig(zeroPool); err != nil {
+		t.Fatalf("savePerfConfig failed: %v", err)
+	}
+	if got := loadPerfConfig().FRPMaxPool; got != 50 {
+		t.Fatalf("expected FRPMaxPool 0 to normalize to 50, got %d", got)
+	}
+	if err := savePerfConfig(custom); err != nil {
+		t.Fatalf("savePerfConfig failed: %v", err)
 	}
 
 	// 3. Partial config unmarshaling: missing fields keep defaults

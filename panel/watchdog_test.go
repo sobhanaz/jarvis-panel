@@ -55,12 +55,17 @@ func TestWatchdogAPIEndpoints(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Create dummy backup
-	backupDir := "/var/backups/hashem"
-	_ = os.MkdirAll(backupDir, 0700)
+	// Create dummy backup in a temp dir (never touch the real /var/backups)
+	oldBackupDir := backupDir
+	backupDir = filepath.Join(tmpDir, "backups")
+	defer func() { backupDir = oldBackupDir }()
+	if err := os.MkdirAll(backupDir, 0700); err != nil {
+		t.Fatal(err)
+	}
 	dummyBackup := filepath.Join(backupDir, "hashem-backup-20260927-120000.enc")
-	_ = os.WriteFile(dummyBackup, []byte("ENCRYPTED-DATA"), 0600)
-	defer os.Remove(dummyBackup)
+	if err := os.WriteFile(dummyBackup, []byte("ENCRYPTED-DATA"), 0600); err != nil {
+		t.Fatal(err)
+	}
 
 	// 1. GET /api/watchdog
 	req := httptest.NewRequest("GET", "/api/watchdog", nil)

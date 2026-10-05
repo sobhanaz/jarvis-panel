@@ -1,0 +1,71 @@
+name: ci
+
+# Quality gate for every push and pull request. The release build lives in
+# build-panel.yml; this workflow never publishes anything.
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  go:
+    name: go (fmt, vet, test -race, build)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: panel
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: panel/go.mod
+          cache-dependency-path: panel/go.sum
+
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "These files are not gofmt-formatted (run: cd panel && gofmt -w .):"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      # -race matters here: the WSS carrier shares state between goroutines.
+      - name: go test
+        run: go test -race -count=1 ./...
+
+      - name: build release targets
+        run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o /dev/null .
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -o /dev/null .
+
+  shell:
+    name: shell (syntax, shellcheck)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: bash -n
+        run: |
+          for f in hashem.sh hashem-chaff.sh install.sh; do
+            bash -n "$f" && echo "syntax ok: $f"
+          done
+
+      # Errors block the build. Warnings are listed so they stay visible while the
+      # backlog (mostly read -r / declare-and-assign style findings) is worked down.
+      - name: shellcheck (errors block)
+        run: shellcheck -S error hashem.sh hashem-chaff.sh install.sh
+
+      - name: shellcheck (warnings, report only)
+        run: shellcheck -S warning -f gcc hashem.sh hashem-chaff.sh install.sh || true

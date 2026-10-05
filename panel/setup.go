@@ -496,10 +496,10 @@ func handlePeersPost(w http.ResponseWriter, r *http.Request) {
 // PATCH /api/peers — edit the forwarded ports of an existing peer tunnel.
 // Body: { "id": N, "ports": [443, 2083] }
 // Strategy (graceful degradation):
-//   1. Try hashem.sh edit-peer-ports --id N --ports P1,P2 (future-proof).
-//   2. If the installer lacks that subcommand, update peers.json directly and
-//      rewrite the frps-N.toml/frpc.toml remotePort fields so the running frp picks
-//      them up on the next reload — then reload via systemctl.
+//  1. Try hashem.sh edit-peer-ports --id N --ports P1,P2 (future-proof).
+//  2. If the installer lacks that subcommand, update peers.json directly and
+//     rewrite the frps-N.toml/frpc.toml remotePort fields so the running frp picks
+//     them up on the next reload — then reload via systemctl.
 func handlePeersPatch(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		ID    int   `json:"id"`

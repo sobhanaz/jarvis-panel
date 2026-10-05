@@ -2,11 +2,15 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"testing"
+	"time"
 )
 
 func TestWSSConfigDefaultsAndLoadSave(t *testing.T) {
@@ -126,5 +130,87 @@ func TestCarrierWSSIntegration(t *testing.T) {
 	}
 	if resp.Active != "wss:8443" {
 		t.Errorf("expected active carrier 'wss:8443', got '%s'", resp.Active)
+	}
+}
+
+// Deterministic reproduction of the leaked-listener bug: if stop() has already run by
+// the time runServer() gets going (the goroutine start races the stop), runServer()
+// must notice and return. Previously it registered its HTTP server afterwards and
+// blocked in ListenAndServe forever, keeping the port bound with nothing to stop it.
+func TestWSSRunServerAfterStopReturnsWithoutListening(t *testing.T) {
+	free, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := free.Addr().(*net.TCPAddr).Port
+	free.Close()
+
+	cfg := defaultWSSConfig()
+	cfg.Role = "server"
+	cfg.UseTLS = false
+	cfg.ListenPort = port
+	cfg.LocalBridgeUDP = 0
+
+	ctx, cancel := context.WithCancel(context.Background())
+	m := &wssCarrierManager{cfg: cfg, ctx: ctx, cancel: cancel}
+	_ = m.stop() // stop wins the race
+
+	done := make(chan struct{})
+	go func() {
+		m.runServer()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("runServer kept running after stop() (leaked listener)")
+	}
+
+	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+	if err != nil {
+		t.Fatalf("port %d still bound after stop: %v", port, err)
+	}
+	ln.Close()
+}
+
+// Real-timing smoke test (not deterministic on its own): rapid start/stop cycles must
+// leave the port free. TestWSSRunServerAfterStopReturnsWithoutListening is the
+// deterministic regression test for the same bug.
+func TestWSSCarrierRapidStartStopLeavesNoListener(t *testing.T) {
+	free, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := free.Addr().(*net.TCPAddr).Port
+	free.Close()
+
+	cfg := defaultWSSConfig()
+	cfg.Enabled = true
+	cfg.Role = "server"
+	cfg.UseTLS = false
+	cfg.ListenPort = port
+	cfg.LocalBridgeUDP = 0
+
+	for i := 0; i < 100; i++ {
+		if err := startWSSCarrier(cfg); err != nil {
+			t.Fatalf("start #%d failed: %v", i, err)
+		}
+		if err := stopWSSCarrier(); err != nil {
+			t.Fatalf("stop #%d failed: %v", i, err)
+		}
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+		if err == nil {
+			ln.Close()
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("port %d still bound after stop: %v", port, err)
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 }

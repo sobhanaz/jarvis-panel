@@ -30,9 +30,9 @@ type perfStatusResponse struct {
 	ChaffProfile     string          `json:"chaff_profile"`
 	DPIEnabled       bool            `json:"dpi_enabled"`
 	DPIRate          string          `json:"dpi_rate"`
-	DPIBurst         int    `json:"dpi_burst"`
-	FRPMaxPool       int    `json:"frp_max_pool"`
-	AutoTune         bool   `json:"auto_tune"`
+	DPIBurst         int             `json:"dpi_burst"`
+	FRPMaxPool       int             `json:"frp_max_pool"`
+	AutoTune         bool            `json:"auto_tune"`
 	InSync           bool            `json:"in_sync"`
 	SyncDetails      string          `json:"sync_details"`
 	Role             string          `json:"role"`

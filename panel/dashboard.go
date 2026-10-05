@@ -491,4 +491,3 @@ func trafficHistory(rng string) []trafficPoint {
 	}
 	return out
 }
-

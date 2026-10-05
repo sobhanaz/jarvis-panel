@@ -91,6 +91,16 @@ func loadCarrierConfig() carrierConfig {
 		c.ActiveCarrier = "direct"
 		needsSave = true
 	}
+	// The FOU carrier was removed; a config still pointing at it would leave the
+	// panel claiming a carrier that no longer exists.
+	if strings.HasPrefix(c.Mode, "fou:") {
+		c.Mode = "direct"
+		needsSave = true
+	}
+	if strings.HasPrefix(c.ActiveCarrier, "fou:") {
+		c.ActiveCarrier = "direct"
+		needsSave = true
+	}
 	if c.FOUPort1 <= 0 {
 		c.FOUPort1 = 443
 	}
@@ -350,4 +360,3 @@ func runHashemCarrierCmd(args ...string) ([]byte, error) {
 	}
 	return nil, fmt.Errorf("hashem script not found")
 }
-
