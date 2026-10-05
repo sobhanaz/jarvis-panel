@@ -62,10 +62,14 @@ jobs:
             bash -n "$f" && echo "syntax ok: $f"
           done
 
+      # Watchdog engine + carrier helpers, with every external signal stubbed.
+      - name: bash tests
+        run: bash tests/run.sh
+
       # Errors block the build. Warnings are listed so they stay visible while the
       # backlog (mostly read -r / declare-and-assign style findings) is worked down.
       - name: shellcheck (errors block)
-        run: shellcheck -S error hashem.sh hashem-chaff.sh install.sh
+        run: shellcheck -S error hashem.sh hashem-chaff.sh install.sh tests/*.sh
 
       - name: shellcheck (warnings, report only)
         run: shellcheck -S warning -f gcc hashem.sh hashem-chaff.sh install.sh || true

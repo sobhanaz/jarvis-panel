@@ -81,6 +81,7 @@ func handleDashboard(w http.ResponseWriter, r *http.Request) {
 		"peers":      peers,
 		"ping_ok":    st.PingOK,
 		"ping":       nilIfEmpty(st.PingMs),
+		"ping_via":   nilIfEmpty(st.PingVia),
 		"role":       nilIfEmpty(st.Role),
 		"local_pub":  nilIfEmpty(detectPublicIP()),
 		"gre": map[string]any{

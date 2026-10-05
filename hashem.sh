@@ -48,7 +48,10 @@ ensure_hashem_bin() {
         done
     fi
 }
-ensure_hashem_bin
+# Sourced (tests, tooling): define functions only - no self-install, no dispatcher.
+HASHEM_SOURCED=0
+[[ "${BASH_SOURCE[0]}" != "${0}" ]] && HASHEM_SOURCED=1
+[[ $HASHEM_SOURCED -eq 1 ]] || ensure_hashem_bin
 
 LOG_DIR="/var/log/hashem"
 
@@ -673,7 +676,10 @@ except Exception:
 
 carrier_set_mode() {
     local M="$1"
-    [[ "$M" == "auto" || "$M" == "direct" || "$M" == fou:* || "$M" == wss* ]] || return 1
+    case "$M" in
+        auto|fou:*) M="direct" ;;   # both were removed; callers print the notice
+    esac
+    [[ "$M" == "direct" || "$M" == wss* ]] || return 1
     init_carrier_json
     python3 -c '
 import json, sys
@@ -719,34 +725,35 @@ os.chmod(p, 0o600)
 ' "$P1" "$P2" 2>/dev/null || true
 }
 
+# The standalone FOU carrier was removed. Older installs still carry its public UDP
+# listeners (443 / 55555 by default; 19998 for the WSS bridge): an open GRE
+# decapsulation endpoint that nothing uses and that stops frps binding UDP 443.
+# Drop them unless a GRE device still encapsulates to the port. Firewall rules are
+# left alone (they are harmless without a listener and may serve something else).
+carrier_drop_legacy_fou() { # $@ = ports
+    local p
+    for p in "$@"; do
+        is_valid_port "$p" || continue
+        if ip -d link show type gre 2>/dev/null | grep -qE "encap-dport ${p}( |$)"; then
+            continue
+        fi
+        ip fou del port "$p" >/dev/null 2>&1 || true
+    done
+}
+
 carrier_init_kernel() {
     modprobe fou >/dev/null 2>&1 || true
     modprobe ip_gre >/dev/null 2>&1 || true
     local P1 P2
     read -r P1 P2 <<< "$(carrier_get_fou_ports)"
-    if is_valid_port "$P1"; then
-        ip fou add port "$P1" ipproto 47 >/dev/null 2>&1 || true
-        iptables -C INPUT -p udp --dport "$P1" -j ACCEPT >/dev/null 2>&1 || \
-            iptables -I INPUT 1 -p udp --dport "$P1" -j ACCEPT >/dev/null 2>&1 || true
-        if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
-            ufw allow "$P1"/udp >/dev/null 2>&1 || true
-        fi
-    fi
-    if is_valid_port "$P2" && [[ "$P2" != "$P1" ]]; then
-        ip fou add port "$P2" ipproto 47 >/dev/null 2>&1 || true
-        iptables -C INPUT -p udp --dport "$P2" -j ACCEPT >/dev/null 2>&1 || \
-            iptables -I INPUT 1 -p udp --dport "$P2" -j ACCEPT >/dev/null 2>&1 || true
-        if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
-            ufw allow "$P2"/udp >/dev/null 2>&1 || true
-        fi
-    fi
-    ip fou add port 19998 ipproto 47 >/dev/null 2>&1 || true
+    carrier_drop_legacy_fou "$P1" "$P2" 19998
 }
 
 carrier_apply() {
     local TARGET="$1"
     local SPECIFIC_IF="${2:-}"
     [[ -z "$TARGET" ]] && TARGET="direct"
+    [[ "$TARGET" == fou:* || "$TARGET" == "auto" ]] && TARGET="direct"   # carriers removed
     carrier_init_kernel
 
     local IFS_TO_APPLY=()
@@ -903,7 +910,7 @@ try:
     p1 = d.get("fou_port1", 443)
     p2 = d.get("fou_port2", 55555)
     wp = d.get("wss_port", 8443)
-    cands = d.get("candidates", ["direct", f"fou:{p1}", f"fou:{p2}", f"wss:{wp}"])
+    cands = [c for c in d.get("candidates", []) if not c.startswith("fou:")] or ["direct", f"wss:{wp}"]
     if cur in cands:
         idx = (cands.index(cur) + 1) % len(cands)
         next_cand = cands[idx]
@@ -4122,7 +4129,8 @@ watchdog_get_peer_gre() {
             elif [[ "$INNER" == "$FOREIGN_GRE_IP" ]]; then
                 PEER="$IRAN_GRE_IP"
             else
-                local IFS=. read -r a b c d <<< "$INNER"
+                local a b c d
+                IFS=. read -r a b c d <<< "$INNER"
                 if (( d % 2 == 0 )); then
                     PEER="$a.$b.$c.$((d - 1))"
                 else
@@ -4147,32 +4155,285 @@ except Exception:
     echo "$PEER"
 }
 
+# ==============================================================================
+#   Watchdog engine
+#
+#   One health verdict per tunnel (the main tunnel plus every peer tunnel), made
+#   from several independent signals rather than a single ICMP ping, and repaired
+#   by restarting only what is broken, with exponential backoff between attempts.
+#
+#   Why: many ISPs drop ICMP inside GRE while TCP flows normally, and a restart
+#   kills every live user connection. A ping-only check that restarts everything
+#   on every failure turns a harmless filter into a restart loop.
+#
+#   Kept compatible with bash 3.2 (no associative arrays, no ${x,,}) so the same
+#   code runs in the local test-suite on macOS and on old servers.
+# ==============================================================================
+WD_STATE_DIR="${WD_STATE_DIR:-/run/hashem-watchdog}"
+WD_COOLDOWN_BASE=120    # seconds; doubles after every repair attempt
+WD_COOLDOWN_MAX=1800    # backoff ceiling (30 min)
+WD_STUCK_ACK_MS=30000   # un-ACKed data older than this on a session = black hole
+
+wd_now() { date +%s; }
+
+# --- tiny key=value state files (one per tunnel) -----------------------------
+wd_state_get() { # $1=file $2=key $3=default
+    local v
+    v=$(sed -n "s/^$2=//p" "$1" 2>/dev/null | tail -n1)
+    echo "${v:-$3}"
+}
+
+wd_state_set() { # $1=file $2=key $3=value
+    local f="$1" k="$2" v="$3" tmp
+    mkdir -p "$(dirname "$f")" 2>/dev/null || return 0
+    tmp="${f}.tmp.$$"
+    { grep -v "^${k}=" "$f" 2>/dev/null; echo "${k}=${v}"; } > "$tmp" 2>/dev/null && mv -f "$tmp" "$f"
+}
+
+wd_cfg_get() { # $1=key $2=default ; bools print as 1/0
+    python3 - "$WATCHDOG_FILE" "$1" "$2" <<'PY' 2>/dev/null || echo "$2"
+import json, sys
+path, key, default = sys.argv[1:4]
+try:
+    v = json.load(open(path)).get(key, default)
+except Exception:
+    v = default
+print(("1" if v else "0") if isinstance(v, bool) else v)
+PY
+}
+
+# --- signals (small and separate so tests can stub each one) -----------------
+wd_gre_if_up() { # interface exists and has the UP flag
+    ip -o link show dev "$1" 2>/dev/null | grep -qE '[<,]UP[,>]'
+}
+
+wd_sig_ping() { ping -c 1 -W 2 "$1" >/dev/null 2>&1; }
+
+wd_sig_tcp() { # $1=host $2=port : can we complete a TCP handshake through the tunnel?
+    [[ -n "$2" ]] && timeout 3 bash -c "exec 3<>/dev/tcp/$1/$2" >/dev/null 2>&1
+}
+
+wd_sig_session() { # established TCP connection with the peer (plain or ::ffff: mapped)
+    local re="(^|[[:space:]]|:|\\[)${1//./\\.}(\\]:|:)[0-9]+"
+    ss -Htn state established 2>/dev/null | grep -qE "$re"
+}
+
+wd_sig_stuck() { # session to the peer holds un-ACKed data that nobody ACKs = black hole
+    local re="(^|[[:space:]]|:|\\[)${1//./\\.}(\\]:|:)[0-9]+"
+    ss -Htin state established 2>/dev/null | RE="$re" awk -v limit="$WD_STUCK_ACK_MS" '
+        BEGIN { hit = 0; stuck = 0 }
+        $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ { hit = ($0 ~ ENVIRON["RE"]); next }
+        hit {
+            un = 0; la = 0
+            for (i = 1; i <= NF; i++) {
+                if ($i ~ /^unacked:/)  { split($i, a, ":"); un = a[2] + 0 }
+                if ($i ~ /^lastack:/)  { split($i, a, ":"); la = a[2] + 0 }
+            }
+            if (un > 0 && la > limit) stuck = 1
+            hit = 0
+        }
+        END { exit(stuck ? 0 : 1) }'
+}
+
+wd_frp_state() { # active | activating | inactive
+    case "$(systemctl is-active "$1" 2>/dev/null)" in
+        active) echo active ;;
+        activating|reloading) echo activating ;;
+        *) echo inactive ;;
+    esac
+}
+
+# --- which tunnels exist -----------------------------------------------------
+# One record per tunnel: id|role|gre_if|peer_gre|frp_unit|frp_port|label
+wd_list_tunnels() {
+    local role="" unit="" port="" peer
+    if [[ -f /etc/frp/frpc.toml ]]; then
+        role="client"; unit="frpc"
+        port=$(sed -n 's/^serverPort *= *\([0-9]*\).*/\1/p' /etc/frp/frpc.toml | head -n1)
+    elif [[ -f /etc/frp/frps.toml ]]; then
+        role="server"; unit="frps"
+        port=$(sed -n 's/^bindPort *= *\([0-9]*\).*/\1/p' /etc/frp/frps.toml | head -n1)
+    fi
+    if [[ -n "$role" ]]; then
+        peer=$(watchdog_get_peer_gre)
+        echo "main|${role}|${TUNNEL_NAME}|${peer}|${unit}|${port}|main"
+    fi
+    if [[ -f "$PEERS_FILE" ]] && command -v python3 >/dev/null 2>&1; then
+        python3 - "$PEERS_FILE" <<'PY' 2>/dev/null
+import json, sys
+try:
+    peers = json.load(open(sys.argv[1])).get("peers", [])
+except Exception:
+    peers = []
+clean = lambda s: str(s).replace("|", "_").replace("\n", " ")
+for p in peers:
+    gre_if, svc = p.get("gre_if", ""), p.get("frps_svc", "")
+    if not gre_if or not svc:
+        continue
+    print("|".join(clean(x) for x in (
+        "peer%s" % p.get("id", "x"), "server", gre_if, p.get("peer_gre", ""),
+        svc, p.get("frp_port", ""), p.get("name", "peer"))))
+PY
+    fi
+}
+
+# --- verdict -------------------------------------------------------------------
+# Probe one tunnel. Prints: gre_up frp link session stuck via
+wd_probe() {
+    local id role gre_if peer frp_unit frp_port label
+    IFS='|' read -r id role gre_if peer frp_unit frp_port label <<< "$1"
+    local gre_up=0 link=0 session=0 stuck=0 via="none" frp
+    wd_gre_if_up "$gre_if" && gre_up=1
+    if [[ -n "$peer" ]]; then
+        if wd_sig_session "$peer"; then
+            session=1; link=1; via="session"
+            wd_sig_stuck "$peer" && stuck=1
+        elif wd_sig_ping "$peer"; then
+            link=1; via="ping"
+        elif [[ "$role" == "client" ]] && wd_sig_tcp "$peer" "$frp_port"; then
+            link=1; via="tcp"
+        fi
+    fi
+    frp=$(wd_frp_state "$frp_unit")
+    echo "$gre_up $frp $link $session $stuck $via"
+}
+
+# wd_fault <role> <gre_up> <frp> <link> <session> <stuck>
+# Prints "" when healthy, otherwise one of:
+#   gre-down    interface missing/down
+#   stuck       session exists but data is black-holed
+#   link-down   (client) peer unreachable by every method
+#   no-session  (client) peer reachable but frpc is not logged in
+#   frp-down    (server) frps not running
+#   waiting     (server) nothing wrong locally; the peer is silent
+wd_fault() {
+    local role="$1" gre_up="$2" frp="$3" link="$4" session="$5" stuck="$6"
+    if (( gre_up == 0 )); then echo "gre-down"; return; fi
+    if (( stuck == 1 )); then echo "stuck"; return; fi
+    if [[ "$role" == "client" ]]; then
+        if (( session == 0 )); then
+            if (( link == 1 )); then echo "no-session"; else echo "link-down"; fi
+        fi
+        return
+    fi
+    if [[ "$frp" != "active" ]]; then echo "frp-down"; return; fi
+    if (( session == 0 && link == 0 )); then echo "waiting"; fi
+}
+
+# wd_decide <fault> <fails> <restarts> <since_last_restart_s> <threshold>
+# Prints "<state> <action> <reason>".
+#   state  up | down | waiting
+#   action NONE | COOLDOWN | RESTART_FRP | RESTART_GRE | RESTART_BOTH
+# The watchdog never switches carrier by itself: moving GRE onto the WSS carrier only
+# works when the panel's WebSocket bridge is running and configured on BOTH ends, and
+# doing it blind can black-hole a tunnel that was merely degraded. After repeated
+# failed repairs the reason is suffixed "+persistent" so the alert can recommend it.
+wd_decide() {
+    local fault="$1" fails="$2" restarts="$3" since="$4" threshold="$5"
+    if [[ -z "$fault" ]]; then echo "up NONE ok"; return; fi
+    if [[ "$fault" == "waiting" ]]; then echo "waiting NONE peer-silent"; return; fi
+    local label="$fault"
+    if (( restarts >= 2 )) && [[ "$fault" == "stuck" || "$fault" == "link-down" ]]; then
+        label="${fault}+persistent"
+    fi
+    # an interface that vanished is repaired at once; everything else must persist
+    if [[ "$fault" != "gre-down" ]] && (( fails < threshold )); then
+        echo "down NONE ${label}(${fails}/${threshold})"; return
+    fi
+    local shift_by=$restarts
+    (( shift_by > 5 )) && shift_by=5
+    local backoff=$(( WD_COOLDOWN_BASE << shift_by ))
+    (( backoff > WD_COOLDOWN_MAX )) && backoff=$WD_COOLDOWN_MAX
+    if (( restarts > 0 && since < backoff )); then
+        echo "down COOLDOWN ${label}(next attempt in $(( backoff - since ))s)"; return
+    fi
+    local action
+    case "$fault" in
+        gre-down)           action="RESTART_GRE" ;;
+        frp-down)           action="RESTART_FRP" ;;
+        link-down)          action="RESTART_BOTH" ;;
+        stuck|no-session)   if (( restarts >= 1 )); then action="RESTART_BOTH"; else action="RESTART_FRP"; fi ;;
+        *)                  action="NONE" ;;
+    esac
+    echo "down $action $label"
+}
+
+# Perform a repair. Only touches the failing tunnel's own units.
+wd_do_action() { # $1=action $2=gre_if $3=frp_unit
+    case "$1" in
+        RESTART_FRP)    systemctl restart "$3" >/dev/null 2>&1 ;;
+        RESTART_GRE)    systemctl restart "${2}.service" >/dev/null 2>&1 ;;
+        RESTART_BOTH)   systemctl restart "${2}.service" >/dev/null 2>&1; sleep 1
+                        systemctl restart "$3" >/dev/null 2>&1 ;;
+    esac
+}
+
+# Evaluate one tunnel, act if needed, remember what happened.
+# Prints: <state>|<action>|<label>|<detail>
+wd_step_tunnel() { # $1=record $2=threshold
+    local rec="$1" threshold="$2"
+    local id role gre_if peer frp_unit frp_port label
+    IFS='|' read -r id role gre_if peer frp_unit frp_port label <<< "$rec"
+    local sf="$WD_STATE_DIR/${id}.state" now fault fails restarts last since
+    local gre_up frp link session stuck via
+    now=$(wd_now)
+    read -r gre_up frp link session stuck via <<< "$(wd_probe "$rec")"
+    fault=$(wd_fault "$role" "$gre_up" "$frp" "$link" "$session" "$stuck")
+
+    fails=$(wd_state_get "$sf" fails 0); restarts=$(wd_state_get "$sf" restarts 0)
+    last=$(wd_state_get "$sf" last_restart 0)
+    if [[ -z "$fault" ]]; then
+        fails=0; restarts=0
+    elif [[ "$fault" != "waiting" ]]; then
+        fails=$(( fails + 1 ))
+    fi
+    since=$(( now - last ))
+    (( last == 0 )) && since=999999
+
+    local state action reason
+    read -r state action reason <<< "$(wd_decide "$fault" "$fails" "$restarts" "$since" "$threshold")"
+    if [[ "$action" != "NONE" && "$action" != "COOLDOWN" ]]; then
+        wd_do_action "$action" "$gre_if" "$frp_unit"
+        restarts=$(( restarts + 1 )); last=$now
+        wd_state_set "$sf" last_restart "$last"
+    fi
+    wd_state_set "$sf" fails "$fails"; wd_state_set "$sf" restarts "$restarts"
+
+    local detail="${label}(${role}): ${reason} [via=${via}]"
+    [[ "$action" != "NONE" ]] && detail="${detail} -> ${action}"
+    echo "${state}|${action}|${label}|${detail}"
+}
+
+# Run every tunnel once (the timer calls this once a minute).
+# Prints a WATCHDOG summary line (same format as `watchdog check`) and an
+# ACTIONS line when something was repaired.
+wd_run_tick() {
+    local threshold rec line state action label detail
+    local overall="up" details="" acted="" count=0
+    threshold=$(wd_cfg_get fail_threshold 2)
+    [[ "$threshold" =~ ^[0-9]+$ ]] || threshold=2
+    while IFS= read -r rec; do
+        [[ -z "$rec" ]] && continue
+        count=$(( count + 1 ))
+        line=$(wd_step_tunnel "$rec" "$threshold")
+        IFS='|' read -r state action label detail <<< "$line"
+        [[ "$state" != "up" ]] && overall="down"
+        details="${details:+$details | }${detail}"
+        [[ "$action" != "NONE" && "$action" != "COOLDOWN" ]] && acted="${acted:+$acted, }${label}: ${action}"
+    done < <(wd_list_tunnels)
+    if (( count == 0 )); then overall="down"; details="no tunnel configured"; fi
+    echo "WATCHDOG status=${overall} fails=0 detail=${details}"
+    [[ -n "$acted" ]] && echo "ACTIONS: repaired ${acted}"
+    if [[ "$details" == *"+persistent"* ]]; then
+        echo "HINT: the direct GRE path keeps failing after repeated repairs; if your ISP filters it, switch the carrier to wss:8443 (panel: Tunnel > Carrier)"
+    fi
+    return 0
+}
+
 watchdog_check() {
     init_watchdog_json
     autotune_tick
-    local PEER_GRE
-    PEER_GRE=$(watchdog_get_peer_gre)
-    local GRE_OK=0
-    if [[ -n "$PEER_GRE" ]] && ping -c 1 -W 2 "$PEER_GRE" >/dev/null 2>&1; then
-        GRE_OK=1
-    fi
-
-    local FRP_NAME=""
-    local FRP_OK=0
-    if [[ -f /etc/frp/frpc.toml ]] || systemctl list-unit-files 2>/dev/null | grep -q "^frpc\.service"; then
-        FRP_NAME="frpc"
-        systemctl is-active --quiet frpc 2>/dev/null && FRP_OK=1
-    elif [[ -f /etc/frp/frps.toml ]] || systemctl list-unit-files 2>/dev/null | grep -q "^frps\.service"; then
-        FRP_NAME="frps"
-        systemctl is-active --quiet frps 2>/dev/null && FRP_OK=1
-    else
-        if systemctl list-units --type=service 2>/dev/null | grep -q 'frps'; then
-            FRP_NAME="frps"
-            FRP_OK=1
-        fi
-    fi
-
-    local FAILS=0
+    local FAILS=0 STATUS="up" DETAIL="" rec count=0
     if [[ -f "$WATCHDOG_FILE" ]] && command -v python3 >/dev/null 2>&1; then
         FAILS=$(python3 -c '
 import json
@@ -4183,27 +4444,23 @@ except Exception:
     print(0)
 ' 2>/dev/null || echo 0)
     fi
-
-    local STATUS="down"
-    local DETAIL=""
-    if [[ $GRE_OK -eq 1 && $FRP_OK -eq 1 ]]; then
-        STATUS="up"
-        DETAIL="GRE ping OK ($PEER_GRE), FRP $FRP_NAME active"
-    else
-        local ERR_PARTS=()
-        if [[ $GRE_OK -ne 1 ]]; then
-            if [[ -z "$PEER_GRE" ]]; then
-                ERR_PARTS+=("GRE interface missing/down")
-            else
-                ERR_PARTS+=("GRE ping $PEER_GRE failed")
-            fi
+    local id role gre_if peer frp_unit frp_port label
+    local gre_up frp link session stuck via fault part
+    while IFS= read -r rec; do
+        [[ -z "$rec" ]] && continue
+        count=$(( count + 1 ))
+        IFS='|' read -r id role gre_if peer frp_unit frp_port label <<< "$rec"
+        read -r gre_up frp link session stuck via <<< "$(wd_probe "$rec")"
+        fault=$(wd_fault "$role" "$gre_up" "$frp" "$link" "$session" "$stuck")
+        if [[ -z "$fault" ]]; then
+            part="${label}(${role}): healthy [via=${via}]"
+        else
+            part="${label}(${role}): ${fault} [via=${via}]"
+            STATUS="down"
         fi
-        if [[ $FRP_OK -ne 1 ]]; then
-            ERR_PARTS+=("FRP ${FRP_NAME:-service} inactive")
-        fi
-        DETAIL=$(IFS="; "; echo "${ERR_PARTS[*]}")
-    fi
-
+        DETAIL="${DETAIL:+$DETAIL | }${part}"
+    done < <(wd_list_tunnels)
+    if (( count == 0 )); then STATUS="down"; DETAIL="no tunnel configured"; fi
     echo "WATCHDOG status=$STATUS fails=$FAILS detail=$DETAIL"
     return 0
 }
@@ -4274,15 +4531,6 @@ watchdog_test() {
         return 1
     fi
 }
-
-restart_all_lite() {
-    local u
-    for u in /etc/systemd/system/gre-t*.service /etc/systemd/system/gre-tunnel.service /etc/systemd/system/frps*.service /etc/systemd/system/frpc.service; do
-        [[ -f "$u" ]] || continue
-        systemctl restart "$(basename "$u")" >/dev/null 2>&1
-    done
-}
-
 
 autotune_tick() {
     [[ ! -f /etc/gre-panel/perf.json ]] && return 0
@@ -4356,10 +4604,13 @@ except Exception as e:
 
     if [[ "$IS_ENABLED" == "True" || "$IS_ENABLED" == "true" ]]; then
         local CHECK_OUT
-        CHECK_OUT=$(watchdog_check)
-        local STATUS DETAIL
-        STATUS=$(echo "$CHECK_OUT" | sed -n 's/.*status=\([^ ]*\).*/\1/p')
-        DETAIL=$(echo "$CHECK_OUT" | sed -n 's/.*detail=\(.*\)/\1/p')
+        CHECK_OUT=$(wd_run_tick)
+        local STATUS DETAIL ACTIONS HINT
+        ACTIONS=$(echo "$CHECK_OUT" | sed -n 's/^ACTIONS: *//p' | head -n1)
+        HINT=$(echo "$CHECK_OUT" | sed -n 's/^HINT: *//p' | head -n1)
+        STATUS=$(echo "$CHECK_OUT" | sed -n 's/^WATCHDOG .*status=\([^ ]*\).*/\1/p' | head -n1)
+        DETAIL=$(echo "$CHECK_OUT" | sed -n 's/^WATCHDOG .*detail=\(.*\)/\1/p' | head -n1)
+        [[ -z "$STATUS" ]] && STATUS="down"
 
         local DECISION
         DECISION=$(CHECK_STATUS="$STATUS" CHECK_DETAIL="$DETAIL" python3 -c '
@@ -4412,44 +4663,8 @@ os.chmod(path, 0o600)
 print(action)
 ' 2>/dev/null)
 
-        if [[ "$DECISION" == DOWN* ]]; then
-            local CMODE
-            CMODE=$(carrier_get_mode)
-            if [[ "$CMODE" == "auto" ]]; then
-                local OLD_C NEW_C
-                OLD_C=$(carrier_get_active)
-                NEW_C=$(carrier_cycle_next)
-                sleep 2
-                local PGRE
-                PGRE=$(watchdog_get_peer_gre)
-                if [[ -n "$PGRE" ]] && ping -c 1 -W 2 "$PGRE" >/dev/null 2>&1; then
-                    watchdog_send "⚡ Auto-Failover: Switched carrier from ${OLD_C} to ${NEW_C} — Tunnel link restored!" || true
-                    python3 -c '
-import json
-path = "'"$WATCHDOG_FILE"'"
-try:
-    with open(path) as f:
-        d = json.load(f)
-    d["consec_fails"] = 0
-    d["last_alert"] = "up"
-    d["down_since"] = 0
-    with open(path + ".tmp", "w") as f:
-        json.dump(d, f, indent=2)
-    import os
-    os.replace(path + ".tmp", path)
-except Exception:
-    pass
-' 2>/dev/null || true
-                    DECISION="RECOVERED 0"
-                fi
-            fi
-
-            if [[ "$DECISION" == DOWN* ]]; then
-                if [[ "$DECISION" == "DOWN" ]]; then
-                    watchdog_send "🔴 Tunnel DOWN: ${DETAIL} (attempting tunnel restart)" || true
-                fi
-                restart_all_lite
-            fi
+        if [[ "$DECISION" == "DOWN" ]]; then
+            watchdog_send "🔴 Tunnel DOWN: ${DETAIL}${ACTIONS:+ — ${ACTIONS}}${HINT:+ — ${HINT}}" || true
         elif [[ "$DECISION" == RECOVERED* ]]; then
             local DMIN
             DMIN=$(echo "$DECISION" | awk '{print $2}')
@@ -5278,10 +5493,9 @@ cli_carrier() {
     local SUB="${1:-status}"
     case "$SUB" in
         status)
-            local MODE ACT P1 P2
+            local MODE ACT
             MODE=$(carrier_get_mode)
             ACT=$(carrier_get_active)
-            read -r P1 P2 <<< "$(carrier_get_fou_ports)"
             local PGRE PING_OUT="no peer"
             PGRE=$(watchdog_get_peer_gre 2>/dev/null)
             if [[ -n "$PGRE" ]]; then
@@ -5297,9 +5511,8 @@ cli_carrier() {
             echo -e "\n${CYAN}==========================================================${NC}"
             echo -e "${CYAN}         Tunnel Carrier & Multi-Protocol Failover         ${NC}"
             echo -e "${CYAN}==========================================================${NC}"
-            echo -e "Failover Mode:    ${YELLOW}${MODE}${NC} (auto / direct / manual)"
+            echo -e "Carrier Mode:     ${YELLOW}${MODE}${NC} (direct / wss:PORT)"
             echo -e "Active Carrier:   ${GREEN}${ACT}${NC}"
-            echo -e "FOU Listeners:    UDP ${P1} / UDP ${P2} (Kernel FOU / ipproto 47)"
             echo -e "Tunnel Health:    ${PING_OUT}"
             python3 -c '
 import json
@@ -5317,13 +5530,15 @@ except Exception:
             echo -e "${CYAN}==========================================================${NC}\n"
             ;;
         mode|set-mode)
-            local TARGET="${2:-auto}"
-            carrier_set_mode "$TARGET"
+            local TARGET="${2:-direct}"
+            case "$TARGET" in
+                auto) echo -e "${YELLOW}[!] Automatic carrier failover was removed (switching blind can black-hole the tunnel). Using direct GRE; pick wss:PORT explicitly if needed.${NC}"; TARGET="direct" ;;
+                fou:*) echo -e "${YELLOW}[!] The standalone FOU carrier was removed. Using direct GRE.${NC}"; TARGET="direct" ;;
+            esac
+            carrier_set_mode "$TARGET" || { echo -e "${RED}[!] Invalid carrier: want direct or wss:PORT${NC}"; return 1; }
             echo -e "${GREEN}[✔️] Carrier mode set to: ${TARGET}${NC}"
-            if [[ "$TARGET" != "auto" ]]; then
-                carrier_apply "$TARGET"
-                echo -e "${GREEN}[✔️] Active carrier applied: ${TARGET}${NC}"
-            fi
+            carrier_apply "$TARGET"
+            echo -e "${GREEN}[✔️] Active carrier applied: ${TARGET}${NC}"
             ;;
         set|set-active|apply)
             local TARGET="${2:-direct}"
@@ -5336,16 +5551,13 @@ except Exception:
             echo -e "${GREEN}[✔️] Cycled carrier to: ${NEW_C}${NC}"
             ;;
         set-ports)
-            local P1="${2:-443}" P2="${3:-55555}"
-            carrier_set_fou_ports "$P1" "$P2"
-            carrier_init_kernel
-            echo -e "${GREEN}[✔️] FOU ports updated: ${P1} and ${P2}${NC}"
+            echo -e "${YELLOW}[!] The standalone FOU carrier was removed; there are no carrier ports to set.${NC}"
             ;;
         kernel-init)
             carrier_init_kernel
             ;;
         *)
-            echo "Usage: hashem carrier [status|mode <auto|direct|fou:PORT>|set <direct|fou:PORT>|next|cycle|set-ports <P1> <P2>]"
+            echo "Usage: hashem carrier [status|mode <direct|wss:PORT>|set <direct|wss:PORT>|next|cycle]"
             return 1
             ;;
     esac
@@ -5775,7 +5987,7 @@ Usage:
   hashem remove-peer --id N [--force] | edit-peer-ports --id N --ports "443, 2083" | peer-list | peer-token --id N
   hashem logs | restart | panel-tls [domain] [email]   # (also: bash hashem.sh ...)
   hashem optimize | restore | tune-status
-  hashem carrier [status|mode auto|direct|fou:P|wss:P|set direct|fou:P|wss:P|next] # multi-carrier failover
+  hashem carrier [status|mode direct|wss:P|set direct|wss:P|next]            # choose the GRE carrier
   hashem perf status|enc on|off|comp on|off|tls on|off|chaff off|low|mid|dpi on|off|apply
   hashem chaff on|off|status                   # traffic obfuscation (idle-gap filler)
   hashem dpi-shield on|off|status              # rate-limit reverse ports against DPI flood
@@ -5964,6 +6176,8 @@ show_credentials_and_exit() {
     echo -e "${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
     echo ""
 }
+
+[[ $HASHEM_SOURCED -eq 1 ]] && return 0
 
 if [[ $# -gt 0 ]]; then
     case "$1" in

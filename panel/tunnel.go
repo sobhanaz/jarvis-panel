@@ -12,7 +12,6 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
-	"time"
 )
 
 // status of GRE + FRP on this machine.
@@ -206,6 +205,7 @@ type peerLive struct {
 	FrpUp    bool    `json:"frp_up"`
 	PingOK   bool    `json:"ping_ok"`
 	PingMs   string  `json:"ping_ms"`
+	PingVia  string  `json:"ping_via,omitempty"` // "icmp" or "tcp" (ICMP is often filtered inside GRE)
 	Rx       *uint64 `json:"rx"`
 	Tx       *uint64 `json:"tx"`
 }
@@ -331,11 +331,9 @@ func livePeers() []peerLive {
 		}
 		l.FrpUp = svcActive(p.FrpsSvc)
 		if p.PeerGre != "" {
-			start := time.Now()
-			if err := exec.Command("ping", "-c", "1", "-W", "2", p.PeerGre).Run(); err == nil {
-				l.PingOK = true
-				l.PingMs = fmt.Sprintf("%.0fms", float64(time.Since(start).Microseconds())/1000)
-			}
+			// server side: nothing listens on the peer, so no connect fallback (port 0)
+			pr := probeLink(p.PeerGre, 0)
+			l.PingOK, l.PingMs, l.PingVia = pr.OK, pr.Ms, pr.Via
 		}
 		l.Rx, l.Tx = ifaceTraffic(p.GreIf)
 		out = append(out, l)
@@ -446,6 +444,7 @@ type tunnelStatus struct {
 	GrePeer    string   `json:"gre_peer"`
 	PingOK     bool     `json:"ping_ok"`
 	PingMs     string   `json:"ping_ms"`
+	PingVia    string   `json:"ping_via,omitempty"` // "icmp" or "tcp"
 	FrpUp      bool     `json:"frp_up"`
 	FrpSvc     string   `json:"frp_svc"`
 	FrpPort    int      `json:"frp_port"`
@@ -566,11 +565,12 @@ func localStatus() tunnelStatus {
 	if st.Gre.Inner != "" {
 		target := grePeerInner(st.Gre.Inner)
 		if target != "" {
-			start := time.Now()
-			if err := exec.Command("ping", "-c", "1", "-W", "2", target).Run(); err == nil {
-				st.PingOK = true
-				st.PingMs = fmt.Sprintf("%.0fms", float64(time.Since(start).Microseconds())/1000)
+			tcpPort := 0
+			if st.FrpSvc == "frpc" { // client: the peer's frps listens on the FRP port
+				tcpPort = st.FrpPort
 			}
+			pr := probeLink(target, tcpPort)
+			st.PingOK, st.PingMs, st.PingVia = pr.OK, pr.Ms, pr.Via
 		}
 	}
 	return st

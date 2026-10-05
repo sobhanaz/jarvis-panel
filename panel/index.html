@@ -1012,7 +1012,8 @@
           <div class="qs-hint">Every failed panel action is recorded here with its code — newest last.</div>
           <div id="errList" class="u-grid-gap-6 u-mt-8"><div class="qs-hint">—</div></div>
         </div>
-      </section>      <section id="tab-perf" hidden>
+      </section>
+      <section id="tab-perf" hidden>
         <!-- Status hero card -->
         <div class="tunnel-card wd-hero-card">
           <div class="tc-header">
@@ -1877,7 +1878,7 @@ function renderPeers(peers) {
           <div class="det-card-head">${ICO_GRE} <span>GRE Tunnel</span></div>
           <div class="det-row"><span class="det-k">Interface</span><span class="det-v">${stBadge(p.gre_up, p.gre_if || 'gre-t' + p.id)}</span></div>
           <div class="det-row"><span class="det-k">GRE Inner</span><span class="det-v mono">${esc(p.local_gre || '?')} ⇄ ${esc(p.peer_gre || '?')}</span></div>
-          <div class="det-row"><span class="det-k">Ping / Latency</span><span class="det-v">${stBadge(p.ping_ok, p.ping_ms || 'no answer')}</span></div>
+          <div class="det-row"><span class="det-k">Ping / Latency</span><span class="det-v">${stBadge(p.ping_ok, p.ping_ok ? ((p.ping_ms || 'ok') + (p.ping_via === 'tcp' ? ' · tcp' : '')) : 'no answer')}</span></div>
         </div>
         <div class="det-card">
           <div class="det-card-head">${ICO_FRP} <span>FRP & Traffic</span></div>
@@ -1943,7 +1944,7 @@ function renderTunnel(st) {
         <div class="det-card">
           <div class="det-card-head">${ICO_GRE} <span>GRE Tunnel</span></div>
           <div class="det-row"><span class="det-k">Interface</span><span class="det-v">${badge(st.gre.exists, (st.gre.name || 'gre-tunnel') + ' ' + (st.gre.inner || ''))}</span></div>
-          <div class="det-row"><span class="det-k">Ping / Latency</span><span class="det-v">${badge(st.ping_ok, st.ping_ms || 'no answer')}</span></div>
+          <div class="det-row"><span class="det-k">Ping / Latency</span><span class="det-v">${badge(st.ping_ok, st.ping_ok ? ((st.ping_ms || 'ok') + (st.ping_via === 'tcp' ? ' · tcp' : '')) : 'no answer')}</span></div>
         </div>
         <div class="det-card">
           <div class="det-card-head">${ICO_FRP} <span>FRP Service</span></div>
